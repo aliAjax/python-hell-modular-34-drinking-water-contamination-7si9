@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class DomainError(Exception):
@@ -16,6 +16,17 @@ class ConflictError(DomainError):
 class NotFoundError(DomainError):
     def __init__(self, code, message):
         super().__init__(code, message, 404)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(value):
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def require_text(payload, name):
@@ -61,7 +72,24 @@ def normalize_create(payload):
     population = int(payload.get("population", 0) or 0)
     if population < 0:
         raise DomainError("invalid_population", "受影响人数不能为负数")
+    source_zone = payload.get("source_zone")
+    if source_zone is not None:
+        source_zone = require_text(payload, "source_zone")
+    else:
+        source_zone = zones[0].strip()
     stable_key = "%s|%s|%s" % (source_id, contaminant, detected_at)
+    work_orders = [
+        {
+            "zone_id": zone.strip(),
+            "type": "flush",
+            "status": "planned",
+            "planned_at": now_iso(),
+            "done_at": None,
+            "withdrawn_at": None,
+            "withdraw_reason": None,
+        }
+        for zone in zones
+    ]
     return {
         "source_id": source_id,
         "contaminant": contaminant,
@@ -69,11 +97,15 @@ def normalize_create(payload):
         "concentration": concentration,
         "limit": limit,
         "zone_ids": [zone.strip() for zone in zones],
+        "source_zone": source_zone,
         "population": population,
         "complaints": int(payload.get("complaints", 0) or 0),
         "notifications": [],
         "response_actions": [],
         "sample_results": [],
+        "work_orders": work_orders,
+        "restoration": None,
+        "restoration_invalidations": [],
         "_stable_key": stable_key,
     }
 

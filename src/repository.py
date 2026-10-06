@@ -1,13 +1,8 @@
 import json
 import sqlite3
-from datetime import datetime, timezone
 
 from .audit import audit_hash, canonical_json
-from .domain import ConflictError, NotFoundError, DomainError
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+from .domain import ConflictError, NotFoundError, DomainError, now_iso, parse_iso
 
 
 class Repository:
@@ -69,6 +64,24 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS zones (
+                    zone_id TEXT PRIMARY KEY,
+                    population INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS pipes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_zone TEXT NOT NULL,
+                    to_zone TEXT NOT NULL,
+                    valve_id TEXT NOT NULL,
+                    UNIQUE(from_zone, to_zone)
+                );
+                CREATE TABLE IF NOT EXISTS valves (
+                    valve_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    reported_at TEXT NOT NULL,
+                    reported_by TEXT,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -257,5 +270,88 @@ class Repository:
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
             return {"counts": counts, "items": self.list_items()}
+        finally:
+            conn.close()
+
+    def setup_network(self, zones, pipes):
+        """Upsert zone population and pipe topology in one transaction."""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for zone in zones:
+                conn.execute(
+                    "INSERT INTO zones(zone_id,population) VALUES(?,?) "
+                    "ON CONFLICT(zone_id) DO UPDATE SET population=excluded.population",
+                    (zone["zone_id"], int(zone.get("population", 0))),
+                )
+            for pipe in pipes:
+                conn.execute(
+                    "INSERT INTO pipes(from_zone,to_zone,valve_id) VALUES(?,?,?) "
+                    "ON CONFLICT(from_zone,to_zone) DO UPDATE SET to_zone=excluded.to_zone, valve_id=excluded.valve_id",
+                    (pipe["from_zone"], pipe["to_zone"], pipe["valve_id"]),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def report_valve(self, valve_id, state, reported_at, reported_by):
+        """Report a valve state with last-write-wins by report timestamp.
+
+        A late-arriving report (reported_at not later than the stored one) is
+        ignored so the newer state is never overwritten.
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT reported_at FROM valves WHERE valve_id=?", (valve_id,)
+            ).fetchone()
+            if row is not None and parse_iso(row["reported_at"]) >= parse_iso(reported_at):
+                conn.execute("COMMIT")
+                return {"valve_id": valve_id, "state": None, "reported_at": row["reported_at"], "kept": True}
+            conn.execute(
+                "INSERT INTO valves(valve_id,state,reported_at,reported_by,updated_at) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(valve_id) DO UPDATE SET state=excluded.state, reported_at=excluded.reported_at, "
+                "reported_by=excluded.reported_by, updated_at=excluded.updated_at",
+                (valve_id, state, reported_at, reported_by, now_iso()),
+            )
+            conn.execute("COMMIT")
+            return {"valve_id": valve_id, "state": state, "reported_at": reported_at, "kept": False}
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def list_valves(self):
+        conn = self.connect()
+        try:
+            rows = conn.execute("SELECT valve_id,state,reported_at,reported_by FROM valves").fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def list_pipes(self):
+        conn = self.connect()
+        try:
+            rows = conn.execute("SELECT from_zone,to_zone,valve_id FROM pipes").fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def list_zones(self):
+        conn = self.connect()
+        try:
+            rows = conn.execute("SELECT zone_id,population FROM zones").fetchall()
+            return [dict(row) for row in rows]
         finally:
             conn.close()
