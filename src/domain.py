@@ -53,11 +53,16 @@ def normalize_create(payload):
     detected_at = parse_timestamp(payload, "detected_at")
     concentration = number(payload, "concentration", 0)
     limit = number(payload, "limit", 0.000001)
+    network = payload.get("network")
     zones = payload.get("zone_ids", [])
-    if not isinstance(zones, list) or not zones:
-        raise DomainError("zones_required", "至少需要一个受影响区域")
+    if zones is None:
+        zones = []
+    if not isinstance(zones, list):
+        raise DomainError("invalid_zones", "区域编号必须是字符串列表")
     if any(not isinstance(zone, str) or not zone.strip() for zone in zones):
         raise DomainError("invalid_zones", "区域编号必须是字符串列表")
+    if not zones and network is None:
+        raise DomainError("zones_required", "至少需要一个受影响区域，或提供管网连通关系 network")
     population = int(payload.get("population", 0) or 0)
     if population < 0:
         raise DomainError("invalid_population", "受影响人数不能为负数")
@@ -71,6 +76,7 @@ def normalize_create(payload):
         "zone_ids": [zone.strip() for zone in zones],
         "population": population,
         "complaints": int(payload.get("complaints", 0) or 0),
+        "network_raw": network,
         "notifications": [],
         "response_actions": [],
         "sample_results": [],

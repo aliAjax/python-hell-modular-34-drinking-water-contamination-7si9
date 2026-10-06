@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
+from .network import is_later as _ts_gt
 
 
 def now_iso():
@@ -204,6 +205,56 @@ class Repository:
                 value["payload"] = json.loads(value["payload"])
                 result.append(value)
             return result
+        finally:
+            conn.close()
+
+    def report_valve(self, item_id, valve_id, state, observed_at, actor, role):
+        """原子地按“最新上报时刻”更新阀门状态。
+
+        BEGIN IMMEDIATE 取写锁后在同一事务内读取当前阀门状态再比较，
+        两个班组并发上报时，晚到的旧时刻不会覆盖更新时刻的状态。
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            payload = json.loads(row["payload"])
+            valve_states = payload.setdefault("valve_states", {})
+            existing = valve_states.get(valve_id) or {}
+            existing_ts = existing.get("observed_at")
+            if existing_ts and not _ts_gt(observed_at, existing_ts):
+                raise ConflictError(
+                    "stale_valve_report",
+                    "已存在 %s 时刻的更新状态，旧时刻 %s 的上报不覆盖" % (existing_ts, observed_at),
+                )
+            previous = dict(existing) if existing else None
+            valve_states[valve_id] = {"state": state, "observed_at": observed_at, "reported_by": actor}
+            version = int(row["version"]) + 1
+            conn.execute(
+                "UPDATE items SET payload=?,version=?,updated_at=? WHERE id=?",
+                (canonical_json(payload), version, now_iso(), item_id),
+            )
+            event_payload = {
+                "valve_id": valve_id,
+                "state": state,
+                "observed_at": observed_at,
+                "previous": previous,
+            }
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (item_id, "report_valve", actor, role, canonical_json(event_payload), now_iso()),
+            )
+            self.append_audit(conn, item_id, "report_valve", actor, role, event_payload)
+            conn.execute("COMMIT")
+            return self.get_item(item_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         finally:
             conn.close()
 

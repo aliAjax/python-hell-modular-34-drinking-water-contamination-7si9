@@ -1,5 +1,10 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>饮用水污染响应</title><body><h1>市政饮用水污染响应</h1><p>使用 JSON API 创建污染事件、登记水源或管网记录，并完成复检、通知、冲洗、消毒和恢复。</p><pre>GET /health
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>饮用水污染响应</title><body><h1>市政饮用水污染响应</h1><p>使用 JSON API 创建污染事件（可携带管网连通关系）、登记水源或管网记录，并完成复检、通知、冲洗、消毒、阀门上报、受影响范围重算和恢复。</p><pre>GET /health
 GET /api/state
 POST /api/items
 POST /api/items/{id}/sources
-POST /api/items/{id}/actions</pre></body></html>
+POST /api/items/{id}/actions
+
+actions: verify, advise, switch_source, flush, disinfect, sample, restore, cancel,
+         report_valve (valve_id/state/observed_at, 最新时刻胜出),
+         recompute_scope (request_id 可失败重试/幂等),
+         update_network</pre><p>范围变化时：新纳入区域补发通知，移出且未开工区域撤回处置；范围一变恢复结论作废并退回待复检。</p></body></html>

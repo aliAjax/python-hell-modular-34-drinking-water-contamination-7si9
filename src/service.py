@@ -1,4 +1,4 @@
-from . import domain, rules
+from . import domain, rules, network
 from .domain import DomainError
 
 
@@ -13,6 +13,19 @@ class Service:
             raise DomainError("forbidden", "当前角色不能创建此类业务记录", 403)
         normalized = domain.normalize_create(payload)
         stable_key = normalized.pop("_stable_key")
+        network_raw = normalized.pop("network_raw", None)
+        if network_raw is not None:
+            net, valve_states, scope = network.build_network_state(network_raw)
+            normalized["network"] = net
+            normalized["valve_states"] = {
+                valve_id: {"state": state, "observed_at": None, "reported_by": None}
+                for valve_id, state in valve_states.items()
+            }
+            normalized["zone_ids"] = list(scope["affected"])
+            normalized["effective_zone_ids"] = list(scope["affected"])
+            normalized["population"] = scope["population"]
+            normalized["scope_epoch"] = 1
+            normalized["scope_basis"] = {"contaminated": scope["contaminated"], "shutoff": scope["shutoff"]}
         return self.repository.create_item(
             rules.ENTITY_TYPE, stable_key, rules.INITIAL_STATUS, normalized, actor, role
         )
@@ -47,9 +60,22 @@ class Service:
         if rules.ENFORCE_REGION and action in rules.REGION_SENSITIVE_ACTIONS and region and role != "regulator":
             if item["payload"].get("region") != region:
                 raise DomainError("region_mismatch", "不能处理其他区域的记录", 403)
+
+        if action == "report_valve":
+            # 先做输入/状态校验，真正的“最新时刻胜出”比较在单事务内完成，避免并发丢失更新
+            rules.apply_action(item, action, payload, actor, role)
+            valve_id = payload["valve_id"].strip()
+            observed_at = payload["observed_at"].strip()
+            self.repository.report_valve(item_id, valve_id, payload["state"], observed_at, actor, role)
+            return self.get_item(item_id)
+
         if action in rules.ACTION_REQUIRES_VERSION and expected_version is None:
             raise DomainError("expected_version_required", "该操作需要 expected_version", 400)
-        new_status, new_payload, event_payload = rules.apply_action(item, action, payload, actor, role)
+        result = rules.apply_action(item, action, payload, actor, role)
+        if result is rules.NOOP:
+            # 幂等命中或范围无变化：不产生新版本，直接返回当前记录
+            return self.get_item(item_id)
+        new_status, new_payload, event_payload = result
         self.repository.apply_action(
             item_id, action, actor, role, new_status, new_payload, event_payload, expected_version
         )
